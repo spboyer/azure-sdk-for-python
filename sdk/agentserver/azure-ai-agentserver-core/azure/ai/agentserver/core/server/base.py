@@ -2,6 +2,7 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # ---------------------------------------------------------
 # pylint: disable=broad-exception-caught,unused-argument,logging-fstring-interpolation,too-many-statements,too-many-return-statements
+import asyncio
 import inspect
 import json
 import os
@@ -151,11 +152,42 @@ class FoundryCBAgent:
                             ctx = TraceContextTextMapPropagator().extract(carrier=context_carrier)
                             token = otel_context.attach(ctx)
                             error_sent = False
+                            # Keepalive: emit SSE comments periodically to prevent
+                            # gateway/proxy idle timeout during long waits (e.g.
+                            # model inference, tool execution).
+                            keepalive_interval = float(os.environ.get("SSE_KEEPALIVE_INTERVAL", "5"))
+                            event_queue: asyncio.Queue = asyncio.Queue()
+                            _KEEPALIVE = object()
+                            _DONE = object()
+
+                            async def _ticker():
+                                try:
+                                    while True:
+                                        await asyncio.sleep(keepalive_interval)
+                                        await event_queue.put(_KEEPALIVE)
+                                except asyncio.CancelledError:
+                                    pass
+
+                            async def _drain():
+                                try:
+                                    # yield prefetched first event
+                                    await event_queue.put(first_event)
+                                    async for event in resp:
+                                        await event_queue.put(event)
+                                finally:
+                                    await event_queue.put(_DONE)
+
+                            ticker_task = asyncio.create_task(_ticker())
+                            drain_task = asyncio.create_task(_drain())
                             try:
-                                # yield prefetched first event
-                                yield _event_to_sse_chunk(first_event)
-                                async for event in resp:
-                                    yield _event_to_sse_chunk(event)
+                                while True:
+                                    item = await event_queue.get()
+                                    if item is _DONE:
+                                        break
+                                    if item is _KEEPALIVE:
+                                        yield ": keepalive\n\n"
+                                        continue
+                                    yield _event_to_sse_chunk(item)
                             except Exception as e:  # noqa: BLE001
                                 err_msg = str(e) if DEBUG_ERRORS else "Internal error"
                                 logger.error("Error in async generator: %s\n%s", e, traceback.format_exc())
@@ -166,6 +198,9 @@ class FoundryCBAgent:
                             finally:
                                 logger.info("End of processing CreateResponse request.")
                                 otel_context.detach(token)
+                                ticker_task.cancel()
+                                if not drain_task.done():
+                                    drain_task.cancel()
                                 if not error_sent:
                                     yield "data: [DONE]\n\n"
 
